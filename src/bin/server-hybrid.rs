@@ -2,6 +2,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::task::Poll;
+use std::{fs, io};
 
 use hyper::HeaderMap;
 use hyper::{body::HttpBody, Body, Request, Response};
@@ -10,6 +11,9 @@ use tonic::async_trait;
 use tonic_example::echo_server::{Echo, EchoServer};
 use tonic_example::{EchoReply, EchoRequest};
 use tower::Service;
+use hyper::server::conn::AddrIncoming;
+use hyper_rustls::TlsAcceptor;
+use pki_types::{CertificateDer, PrivateKeyDer};
 
 struct MyEcho;
 
@@ -25,9 +29,13 @@ impl Echo for MyEcho {
     }
 }
 
+fn error(err: String) -> io::Error {
+    io::Error::new(io::ErrorKind::Other, err)
+}
+
 #[tokio::main]
-async fn main() {
-    let addr = SocketAddr::from(([0, 0, 0, 0], 3000));
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let addr = SocketAddr::from(([0, 0, 0, 0], 3030));
 
     let axum_make_service = axum::Router::new()
         .route("/", axum::routing::get(|| async { "Hello world!" }))
@@ -39,11 +47,33 @@ async fn main() {
 
     let hybrid_make_service = hybrid(axum_make_service, grpc_service);
 
-    let server = hyper::Server::bind(&addr).serve(hybrid_make_service);
+    // Load public certificate.
+    let certs = load_certs("sample.pem")?;
+    // Load private key.
+    let key = load_private_key("sample.rsa")?;
+    // Build TLS configuration.
 
+    // Create a TCP listener via tokio.
+    let incoming = AddrIncoming::bind(&addr)?;
+    let acceptor = TlsAcceptor::builder()
+        .with_single_cert(certs, key)
+        .map_err(|e| error(format!("{}", e)))?
+        .with_all_versions_alpn()
+        .with_incoming(incoming);
+    let server = hyper::Server::builder(acceptor).serve(hybrid_make_service);
+
+    // Run the future, keep going until an error occurs.
+    println!("Starting to serve on https://{}.", addr);
+    
     if let Err(e) = server.await {
         eprintln!("server error: {}", e);
     }
+
+    Ok(())
+
+    // let server = hyper::Server::bind(&addr).serve(hybrid_make_service);
+
+    
 }
 
 fn hybrid<MakeWeb, Grpc>(make_web: MakeWeb, grpc: Grpc) -> HybridMakeService<MakeWeb, Grpc> {
@@ -222,4 +252,26 @@ where
             },
         }
     }
+}
+
+// Load public certificate from file.
+fn load_certs(filename: &str) -> io::Result<Vec<CertificateDer<'static>>> {
+    // Open certificate file.
+    let certfile = fs::File::open(filename)
+        .map_err(|e| error(format!("failed to open {}: {}", filename, e)))?;
+    let mut reader = io::BufReader::new(certfile);
+
+    // Load and return certificate.
+    rustls_pemfile::certs(&mut reader).collect()
+}
+
+// Load private key from file.
+fn load_private_key(filename: &str) -> io::Result<PrivateKeyDer<'static>> {
+    // Open keyfile.
+    let keyfile = fs::File::open(filename)
+        .map_err(|e| error(format!("failed to open {}: {}", filename, e)))?;
+    let mut reader = io::BufReader::new(keyfile);
+
+    // Load and return a single private key.
+    rustls_pemfile::private_key(&mut reader).map(|key| key.unwrap())
 }
