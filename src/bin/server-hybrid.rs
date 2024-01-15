@@ -5,15 +5,25 @@ use std::task::Poll;
 use std::{fs, io};
 
 use hyper::HeaderMap;
-use hyper::{body::HttpBody, Body, Request, Response};
+use hyper::{body::HttpBody, Body, Request, Response, client::HttpConnector};
+use axum::{
+    extract::Extension,
+    routing::get,
+    http::uri::Uri,
+    Router,
+};
 use pin_project::pin_project;
 use tonic::async_trait;
 use tonic_example::echo_server::{Echo, EchoServer};
 use tonic_example::{EchoReply, EchoRequest};
 use tower::Service;
 use hyper::server::conn::AddrIncoming;
-use hyper_rustls::TlsAcceptor;
+use hyper_rustls::{TlsAcceptor, HttpsConnector, HttpsConnectorBuilder};
 use pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::RootCertStore;
+use hyper::StatusCode;
+
+type Client = hyper::client::Client<HttpsConnector<HttpConnector>, Body>;
 
 struct MyEcho;
 
@@ -37,8 +47,39 @@ fn error(err: String) -> io::Error {
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let addr = SocketAddr::from(([0, 0, 0, 0], 3030));
 
+    // let client = Client::builder()
+    //     .http2_only(true)
+    //     .build_http();
+
+    // let client = Client::new();
+    // 
+    // Load public certificate.
+    let certs = load_certs("sample.pem")?;
+
+    
+    let mut roots = RootCertStore::empty();
+    roots.add_parsable_certificates(certs.clone());
+    // TLS client config using the custom CA store for lookups
+    let tls = rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+
+    let https = HttpsConnectorBuilder::new()
+        .with_tls_config(tls)
+        .https_or_http()
+        .enable_http2()
+        .build();
+
+    let client: hyper::client::Client<_, hyper::Body> = hyper::client::Client::builder()
+        .build(https);
+
+    let influx_router = Router::new()
+        .route("/*rest", get(influx_handler))
+        .layer(Extension(client));
+
     let axum_make_service = axum::Router::new()
-        .route("/", axum::routing::get(|| async { "Hello world!" }))
+        .route("/", get(|| async { "Hello world!" }))
+        .nest("/influx", influx_router)
         .into_make_service();
 
     let grpc_service = tonic::transport::Server::builder()
@@ -47,8 +88,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let hybrid_make_service = hybrid(axum_make_service, grpc_service);
 
-    // Load public certificate.
-    let certs = load_certs("sample.pem")?;
     // Load private key.
     let key = load_private_key("sample.rsa")?;
     // Build TLS configuration.
@@ -61,6 +100,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .with_all_versions_alpn()
         .with_incoming(incoming);
     let server = hyper::Server::builder(acceptor).serve(hybrid_make_service);
+    // let server = hyper::Server::bind(&addr).serve(hybrid_make_service);
 
     // Run the future, keep going until an error occurs.
     println!("Starting to serve on https://{}.", addr);
@@ -69,11 +109,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         eprintln!("server error: {}", e);
     }
 
-    Ok(())
+    Ok(())    
+}
 
-    // let server = hyper::Server::bind(&addr).serve(hybrid_make_service);
+async fn influx_handler(Extension(client): Extension<Client>, req: Request<Body>) -> Response<Body> {
+    let path = req.uri().path();
+    let path_query = req
+        .uri()
+        .path_and_query()
+        .map(|v| v.as_str())
+        .unwrap_or(path);
 
-    
+    let uri = format!("https://localhost:8086{}", path_query);
+
+    println!("{}", uri);
+
+    let uri = Uri::try_from(uri).unwrap();
+
+
+    // client.request(req).await.unwrap();
+
+
+    // let mut response = Response::new(Body::empty());
+
+    let fut = async move {
+        let res = client
+            .get(uri)
+            .await;
+
+        let res = res.unwrap_or_else(|_err| {
+            Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Body::empty())
+                .expect("building error response")
+        });
+        //
+        // println!("Status:\n{}", res.status());
+        // println!("Headers:\n{:#?}", res.headers());
+        res
+        // let body: Body = res.into_body();
+        // let body = hyper::body::to_bytes(body)
+        //     .await
+        //     .map_err(|e| error(format!("Could not get body: {:?}", e)))?;
+        // println!("Body:\n{}", String::from_utf8_lossy(&body))
+    };
+
+    fut.await
 }
 
 fn hybrid<MakeWeb, Grpc>(make_web: MakeWeb, grpc: Grpc) -> HybridMakeService<MakeWeb, Grpc> {
