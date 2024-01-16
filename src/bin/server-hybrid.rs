@@ -97,7 +97,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let acceptor = TlsAcceptor::builder()
         .with_single_cert(certs, key)
         .map_err(|e| error(format!("{}", e)))?
-        .with_all_versions_alpn()
+        // The order of ALPN protocols is important. InfluxDB does not support http/2 and gRPC requires http/2. Listing
+        // http/1.1 first allows a InfluxDB client to connect without automatically upgrading to http/2
+        .with_alpn_protocols(vec![b"http/1.1".to_vec(), b"h2".to_vec(), b"http/1.0".to_vec()])
         .with_incoming(incoming);
     let server = hyper::Server::builder(acceptor).serve(hybrid_make_service);
     // let server = hyper::Server::bind(&addr).serve(hybrid_make_service);
@@ -124,7 +126,9 @@ async fn influx_handler(Extension(client): Extension<Client>, req: Request<Body>
 
     println!("{}", uri);
 
-    let uri = Uri::try_from(uri).unwrap();
+    // let uri = Uri::try_from(uri).unwrap();
+
+    *req.uri_mut() = Uri::try_from(uri).unwrap();
 
 
     // client.request(req).await.unwrap();
@@ -134,10 +138,11 @@ async fn influx_handler(Extension(client): Extension<Client>, req: Request<Body>
 
     let fut = async move {
         let res = client
-            .get(uri)
+            .request(req)
             .await;
 
         let res = res.unwrap_or_else(|_err| {
+            eprintln!("error: {}", _err);
             Response::builder()
                 .status(StatusCode::INTERNAL_SERVER_ERROR)
                 .body(Body::empty())
